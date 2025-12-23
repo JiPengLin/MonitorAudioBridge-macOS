@@ -1,4 +1,4 @@
-# U2723QE-Volume-Fix Setup Guide
+# MonitorAudioBridge-macOS
 
 ### 📜 Context (Why this exists)
 The Dell U2723QE monitor uses the **MediaTek MT9800** controller. Its 3.5mm AUX jack gain is not mapped to the DDC/CI protocol. As a result, macOS locks the volume slider to 100% when outputting via DisplayPort/USB-C, making it impossible to adjust headphone volume using the keyboard.
