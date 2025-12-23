@@ -34,7 +34,7 @@ brew install --cask blackhole-2ch
 *   **Sample Rate Sync**: Open the `Audio MIDI Setup` app. Ensure both **DELL U2723QE** and **BlackHole 2ch** are set to the same sample rate (e.g., **48.0 kHz**).
 
 #### 4. Prepare the Script
-Create a file named `main.swift` in your project folder and paste the final "Smart Reconnect" version of the code.
+Download the file named `main.swift` in your project folder.
 
 #### 5. Confirm Device Names (Crucial)
 Before compiling, ensure the strings in the `getDeviceID` function match your system's names exactly:
