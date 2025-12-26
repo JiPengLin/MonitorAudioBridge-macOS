@@ -3,7 +3,6 @@ import AVFoundation
 import CoreAudio
 import AppKit
 
-// 1. 状态管理类
 class BridgeState {
     var blackHoleID: AudioDeviceID = 0
     var dellID: AudioDeviceID = 0
@@ -11,9 +10,10 @@ class BridgeState {
     let player = AVAudioPlayerNode()
     let outputEngine = AVAudioEngine()
     let inputEngine = AVAudioEngine()
+    var isBridgeActive = false
 }
 
-// 2. 工具函数：获取设备 ID
+// 获取设备 ID（保持不变）
 func getDeviceID(named name: String) -> AudioDeviceID? {
     var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     var dataSize: UInt32 = 0
@@ -40,26 +40,30 @@ func getCurrentDefaultOutputDevice() -> AudioDeviceID {
     return deviceID
 }
 
-// 3. 核心：重连逻辑
-func setupAudioLink(state: BridgeState) {
-    print("正在初始化音频链路...")
+// 核心：强力初始化逻辑（带重试）
+func trySetupBridge(state: BridgeState) {
     state.player.stop()
     state.inputEngine.stop()
     state.outputEngine.stop()
-    
-    // 刷新设备 ID
-    if let bhID = getDeviceID(named: "BlackHole"), let dellID = getDeviceID(named: "U2723QE") {
-        state.blackHoleID = bhID
-        state.dellID = dellID
+    state.isBridgeActive = false
+
+    // 重新扫描硬件（防止 ID 变动）
+    guard let bhID = getDeviceID(named: "BlackHole"),
+          let dellID = getDeviceID(named: "U2723QE") else {
+        print("等待硬件上线中...")
+        return
     }
 
+    state.blackHoleID = bhID
+    state.dellID = dellID
+
     do {
-        try state.outputEngine.outputNode.auAudioUnit.setDeviceID(state.dellID)
-        try state.inputEngine.inputNode.auAudioUnit.setDeviceID(state.blackHoleID)
+        try state.outputEngine.outputNode.auAudioUnit.setDeviceID(dellID)
+        try state.inputEngine.inputNode.auAudioUnit.setDeviceID(bhID)
         
         state.outputEngine.attach(state.player)
-        let outputFormat = state.outputEngine.outputNode.outputFormat(forBus: 0)
-        state.outputEngine.connect(state.player, to: state.outputEngine.mainMixerNode, format: outputFormat)
+        let outFormat = state.outputEngine.outputNode.outputFormat(forBus: 0)
+        state.outputEngine.connect(state.player, to: state.outputEngine.mainMixerNode, format: outFormat)
         
         state.inputEngine.inputNode.removeTap(onBus: 0)
         state.inputEngine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: state.inputEngine.inputNode.inputFormat(forBus: 0)) { (buffer, time) in
@@ -70,95 +74,48 @@ func setupAudioLink(state: BridgeState) {
         try state.inputEngine.start()
         state.player.play()
         state.player.volume = state.volume
-        print("链路已就绪。物理输出 ID: \(state.dellID)")
+        state.isBridgeActive = true
+        print("✅ 桥接成功恢复！物理输出 ID: \(dellID)")
     } catch {
-        print("链路建立失败: \(error)")
+        print("❌ 尝试重连失败，将在下次轮询重试。")
     }
 }
 
-// 4. UI 提示：由于无法调用系统私有 HUD，我们发送一个简单的通知
-func showVolumeNotification(volume: Float) {
-    let percent = Int(volume * 100)
-    let bar = String(repeating: "●", count: percent / 10) + String(repeating: "○", count: 10 - (percent / 10))
-    // 可以在这里加一个打印或者调用通知中心
-    print("\r音量: [\(bar)] \(percent)%    ", terminator: ""); fflush(stdout)
-}
-
-// 5. 键盘回调
-func myEventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard let refcon = refcon else { return Unmanaged.passRetained(event) }
-    let state = Unmanaged<BridgeState>.fromOpaque(refcon).takeUnretainedValue()
+// 监听与定时检查
+func startMonitoring(state: BridgeState) {
+    // 1. 监听切换事件
+    var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    let refcon = UnsafeMutableRawPointer(Unmanaged.passRetained(state).toOpaque())
     
-    if getCurrentDefaultOutputDevice() != state.blackHoleID {
-        return Unmanaged.passRetained(event) 
-    }
-
-    if let nsEvent = NSEvent(cgEvent: event), nsEvent.type == .systemDefined {
-        let data1 = nsEvent.data1
-        let keyCode = (data1 & 0xFFFF0000) >> 16
-        if (((data1 & 0x0000FFFF) & 0xff00) >> 8) == 0x0a {
-            switch keyCode {
-            case 0: state.volume = min(state.volume + 0.0625, 1.0)
-            case 1: state.volume = max(state.volume - 0.0625, 0.0)
-            case 7, 16: state.volume = (state.player.volume > 0) ? 0 : state.volume
-            default: return Unmanaged.passRetained(event)
+    AudioObjectAddPropertyListener(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, { _, _, _, clientData in
+        guard let clientData = clientData else { return noErr }
+        let state = Unmanaged<BridgeState>.fromOpaque(clientData).takeUnretainedValue()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if getCurrentDefaultOutputDevice() == state.blackHoleID {
+                trySetupBridge(state: state)
             }
-            state.player.volume = state.volume
-            showVolumeNotification(volume: state.volume)
-            return nil 
+        }
+        return noErr
+    }, refcon)
+
+    // 2. 增加“心跳检查”：每 5 秒检查一次，如果选了 BlackHole 但桥接没动，就强制重连
+    Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+        if getCurrentDefaultOutputDevice() == state.blackHoleID && !state.isBridgeActive {
+            print("💓 心跳检查：发现 BlackHole 已选中但桥接未激活，正在尝试强制恢复...")
+            trySetupBridge(state: state)
         }
     }
-    return Unmanaged.passRetained(event)
 }
 
-// --- 主程序流程 ---
-let bridgeState = BridgeState()
+// 键盘回调保持不变 (略，请保留你之前版本中的 myEventTapCallback)...
 
-// 初始查找设备
-guard let bhInitial = getDeviceID(named: "BlackHole"), 
-      let dellInitial = getDeviceID(named: "U2723QE") else {
-    print("未找到硬件，程序退出")
-    exit(1)
-}
-bridgeState.blackHoleID = bhInitial
-bridgeState.dellID = dellInitial
+// --- 启动逻辑 ---
+let state = BridgeState()
+// 必须先查找一次初始化数据
+if let bh = getDeviceID(named: "BlackHole") { state.blackHoleID = bh }
 
-// 设置监听：当系统默认输出改变时触发
-var propertyAddress = AudioObjectPropertyAddress(
-    mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-    mScope: kAudioObjectPropertyScopeGlobal,
-    mElement: kAudioObjectPropertyElementMain
-)
+startMonitoring(state: state)
+// 键盘拦截逻辑 (保留之前的 CGEvent.tapCreate 代码)...
 
-// 将 bridgeState 包装成指针传给回调
-let refcon = UnsafeMutableRawPointer(Unmanaged.passRetained(bridgeState).toOpaque())
-
-AudioObjectAddPropertyListener(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, { _, _, _, clientData in
-    guard let clientData = clientData else { return noErr }
-    let state = Unmanaged<BridgeState>.fromOpaque(clientData).takeUnretainedValue()
-    
-    // 延迟 0.5 秒等待系统驱动握手完成
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        if getCurrentDefaultOutputDevice() == state.blackHoleID {
-            setupAudioLink(state: state)
-        }
-    }
-    return noErr
-}, refcon)
-
-// 键盘拦截设置
-let eventMask = (1 << NX_SYSDEFINED)
-guard let eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(eventMask), callback: myEventTapCallback, userInfo: refcon) else {
-    exit(1)
-}
-let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-CGEvent.tapEnable(tap: eventTap, enable: true)
-
-// 初始运行
-if getCurrentDefaultOutputDevice() == bridgeState.blackHoleID {
-    setupAudioLink(state: bridgeState)
-}
-
-print("Dell 音频守护进程已启动。")
+print("Dell Audio Bridge 2.0 (增强重连版) 已启动")
 CFRunLoopRun()

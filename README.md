@@ -64,7 +64,7 @@ swiftc main.swift -o DellAudioBridge
 3.  **Configure**: Enter the following (⚠️ **Replace `YOUR_USERNAME` with your real macOS username**):
     ```bash
     # Clean up old processes
-    pkill DellAudioBridge
+    pkill -9 DellAudioBridge
     sleep 1
     # Start the daemon silently
     /Users/YOUR_USERNAME/Project/AudioBridge/DellAudioBridge > /dev/null 2>&1 &
